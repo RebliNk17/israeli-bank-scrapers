@@ -1,5 +1,7 @@
+import crypto from 'node:crypto';
 import moment from 'moment';
 import { type HTTPRequest, type Frame, type Page } from 'puppeteer';
+import { ScraperProgressTypes } from '../definitions';
 import { getDebug } from '../helpers/debug';
 import { clickButton, elementPresentOnPage, pageEval, waitUntilElementFound } from '../helpers/elements-interactions';
 import { fetchPost } from '../helpers/fetch';
@@ -15,6 +17,7 @@ import {
   type TransactionsAccount,
 } from '../transactions';
 import { BaseScraperWithBrowser, LoginResults, type LoginOptions } from './base-scraper-with-browser';
+import { ScraperErrorTypes } from './errors';
 import { type ScraperScrapingResult, type ScraperOptions } from './interface';
 
 const apiHeaders = {
@@ -34,6 +37,23 @@ const FRAMES_REQUEST_ENDPOINT = 'https://api.cal-online.co.il/Frames/api/Frames/
 const PENDING_TRANSACTIONS_REQUEST_ENDPOINT =
   'https://api.cal-online.co.il/Transactions/api/approvals/getClearanceRequests';
 const SSO_AUTHORIZATION_REQUEST_ENDPOINT = 'https://connect.cal-online.co.il/col-rest/calconnect/authentication/SSO';
+
+const MOBILE_API_BASE_URL = 'https://api-cc.cal-online.co.il';
+const MOBILE_LOGIN_ENDPOINT = `${MOBILE_API_BASE_URL}/Authentication/api/login/regularLogin`;
+const MOBILE_BIO_LOGIN_ENDPOINT = `${MOBILE_API_BASE_URL}/Authentication/api/login/bioLogin`;
+const MOBILE_INIT_ENDPOINT = `${MOBILE_API_BASE_URL}/Authentication/api/account/init`;
+const MOBILE_FRAMES_ENDPOINT = `${MOBILE_API_BASE_URL}/Frames/api/Frames/GetTotalFrameStatus`;
+const MOBILE_PENDING_TRANSACTIONS_ENDPOINT = `${MOBILE_API_BASE_URL}/Transactions/api/approvals/getClearanceRequests`;
+const MOBILE_TRANSACTIONS_ENDPOINT = `${MOBILE_API_BASE_URL}/Transactions/api/transactionsDetails/getCardTransactionsDetails`;
+const MOBILE_X_SITE_ID = '8D37DF16-5812-4ACD-BAE7-CD1A5BFA2207';
+const MOBILE_APP_VERSION = '6.26.17';
+const mobileApiHeaders = {
+  'User-Agent':
+    'Mozilla/5.0 (Linux; Android 11; Pixel 3 Build/RQ1A.210105.003; wv) AppleWebKit/537.36 (KHTML, like Gecko) Version/4.0 Chrome/131.0.6778.135 Mobile Safari/537.36',
+  Accept: 'application/json',
+  platform: 'android',
+  version: MOBILE_APP_VERSION,
+};
 
 const InvalidPasswordMessage = 'שם המשתמש או הסיסמה שהוזנו שגויים';
 const ChangePasswordMessage = 'להחליף סיסמה';
@@ -187,6 +207,17 @@ interface FramesResponse {
     calIssuedCards?: IssuedCardsGroup;
     bankIssuedCards?: IssuedCardsGroup;
   };
+}
+
+interface MobileLoginResponse {
+  statusCode?: number;
+  statusDescription?: string;
+  statusTitle?: string;
+  result?: {
+    calConnectToken?: string;
+    hash?: string;
+    temporaryGuid?: string;
+  } | null;
 }
 
 interface AuthModule {
@@ -412,12 +443,108 @@ function convertParsedDataToTransactions(
   });
 }
 
-type ScraperSpecificCredentials = { username: string; password: string };
+type ScraperSpecificCredentials = {
+  username: string;
+  password: string;
+  otpLongTermToken?: string;
+};
 
 class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> {
   private authorization: string | undefined = undefined;
 
+  private mobileTokenGuid = '';
+
+  public mobileBioHash: string | undefined;
+
   private authRequestPromise: Promise<HTTPRequest | undefined> | undefined;
+
+  private useMobileApi(): boolean {
+    return Boolean(this.options.optInFeatures?.includes('visaCal:useMobileApi'));
+  }
+
+  override async initialize() {
+    if (this.useMobileApi()) {
+      this.emitProgress(ScraperProgressTypes.Initializing);
+      return;
+    }
+    await super.initialize();
+  }
+
+  override async terminate(success: boolean) {
+    if (this.useMobileApi()) {
+      this.emitProgress(ScraperProgressTypes.Terminating);
+      return;
+    }
+    await super.terminate(success);
+  }
+
+  override async login(credentials: ScraperSpecificCredentials): Promise<ScraperScrapingResult> {
+    if (!this.useMobileApi()) {
+      return super.login(credentials);
+    }
+    this.emitProgress(ScraperProgressTypes.LoggingIn);
+    try {
+      let loginResp: MobileLoginResponse | undefined;
+      if (credentials.otpLongTermToken) {
+        loginResp = await fetchPost<MobileLoginResponse>(
+          MOBILE_BIO_LOGIN_ENDPOINT,
+          { hash: credentials.otpLongTermToken },
+          {
+            ...mobileApiHeaders,
+            'X-Site-Id': MOBILE_X_SITE_ID,
+            'Content-Type': 'application/json',
+          },
+        ).catch(() => undefined);
+      }
+
+      if (!loginResp || loginResp.statusCode !== 1 || !loginResp.result?.calConnectToken) {
+        loginResp = await fetchPost<MobileLoginResponse>(
+          MOBILE_LOGIN_ENDPOINT,
+          {
+            username: credentials.username,
+            password: credentials.password,
+            uuid: crypto.randomUUID().replace(/-/g, ''),
+            newPassword: null,
+          },
+          {
+            ...mobileApiHeaders,
+            'X-Site-Id': MOBILE_X_SITE_ID,
+            'Content-Type': 'application/json',
+          },
+        );
+      }
+
+      if (loginResp?.statusCode === 1 && loginResp.result?.calConnectToken) {
+        this.authorization = `CALAuthScheme ${String(loginResp.result.calConnectToken).trim()}`;
+        this.mobileTokenGuid = loginResp.result.temporaryGuid ?? '';
+        if (loginResp.result.hash) {
+          this.mobileBioHash = loginResp.result.hash;
+        }
+        this.emitProgress(ScraperProgressTypes.LoginSuccess);
+        return { success: true };
+      }
+
+      this.emitProgress(ScraperProgressTypes.LoginFailed);
+      if (loginResp?.statusCode === 4) {
+        return {
+          success: false,
+          errorType: ScraperErrorTypes.InvalidPassword,
+        };
+      }
+      return {
+        success: false,
+        errorType: ScraperErrorTypes.General,
+        errorMessage: loginResp?.statusDescription || 'Cal mobile login failed',
+      };
+    } catch (e) {
+      this.emitProgress(ScraperProgressTypes.LoginFailed);
+      return {
+        success: false,
+        errorType: ScraperErrorTypes.General,
+        errorMessage: (e as Error).message,
+      };
+    }
+  }
 
   openLoginPopup = async () => {
     debug('open login popup, wait until login button available');
@@ -437,6 +564,23 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
   };
 
   async getCards() {
+    if (this.useMobileApi() && this.authorization) {
+      const initData = await fetchPost<InitResponse>(
+        MOBILE_INIT_ENDPOINT,
+        { tokenGuid: this.mobileTokenGuid },
+        {
+          ...mobileApiHeaders,
+          Authorization: this.authorization,
+          'X-Site-Id': MOBILE_X_SITE_ID,
+          'Content-Type': 'application/json',
+        },
+      );
+      if (!initData?.result?.cards) {
+        throw new Error('could not fetch cards from Cal mobile init endpoint');
+      }
+      return initData.result.cards.map(({ cardUniqueId, last4Digits }) => ({ cardUniqueId, last4Digits }));
+    }
+
     const initData = await waitUntil(
       () => getFromSessionStorage<InitResponse>(this.page, 'init'),
       'get init data in session storage',
@@ -464,6 +608,9 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
   }
 
   async getXSiteId() {
+    if (this.useMobileApi()) {
+      return Promise.resolve(MOBILE_X_SITE_ID);
+    }
     /*
       I don't know if the constant below will change in the feature.
       If so, use the next code:
@@ -524,15 +671,21 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
     Authorization: string,
     xSiteId: string,
   ): Promise<TransactionsAccount> {
+    const isMobile = this.useMobileApi();
+    const headers = isMobile ? mobileApiHeaders : apiHeaders;
+    const framesEndpoint = isMobile ? MOBILE_FRAMES_ENDPOINT : FRAMES_REQUEST_ENDPOINT;
+    const pendingEndpoint = isMobile ? MOBILE_PENDING_TRANSACTIONS_ENDPOINT : PENDING_TRANSACTIONS_REQUEST_ENDPOINT;
+    const txnsEndpoint = isMobile ? MOBILE_TRANSACTIONS_ENDPOINT : TRANSACTIONS_REQUEST_ENDPOINT;
+
     debug('fetch frames (misgarot) for card %s', card.cardUniqueId);
     const frames = await fetchPost<FramesResponse>(
-      FRAMES_REQUEST_ENDPOINT,
+      framesEndpoint,
       { cardsForFrameData: [{ cardUniqueId: card.cardUniqueId }] },
       {
         Authorization,
         'X-Site-Id': xSiteId,
         'Content-Type': 'application/json',
-        ...apiHeaders,
+        ...headers,
       },
     );
 
@@ -580,13 +733,13 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
 
     debug(`fetch pending transactions for card ${card.cardUniqueId}`);
     let pendingData = await fetchPost(
-      PENDING_TRANSACTIONS_REQUEST_ENDPOINT,
+      pendingEndpoint,
       { cardUniqueIDArray: [card.cardUniqueId] },
       {
         Authorization,
         'X-Site-Id': xSiteId,
         'Content-Type': 'application/json',
-        ...apiHeaders,
+        ...headers,
       },
     );
 
@@ -594,13 +747,13 @@ class VisaCalScraper extends BaseScraperWithBrowser<ScraperSpecificCredentials> 
     for (let i = 0; i <= months; i++) {
       const month = finalMonthToFetchMoment.clone().subtract(i, 'months');
       const monthData = await fetchPost(
-        TRANSACTIONS_REQUEST_ENDPOINT,
+        txnsEndpoint,
         { cardUniqueId: card.cardUniqueId, month: month.format('M'), year: month.format('YYYY') },
         {
           Authorization,
           'X-Site-Id': xSiteId,
           'Content-Type': 'application/json',
-          ...apiHeaders,
+          ...headers,
         },
       );
 
